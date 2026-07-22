@@ -1,22 +1,24 @@
-"""Training orchestration for Whisper fine-tuning."""
+"""Accelerate-based Whisper training loop (explicit, debuggable, production-style)."""
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import torch
 import yaml
+from accelerate import Accelerator
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import (
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
     WhisperForConditionalGeneration,
     WhisperProcessor,
+    get_cosine_schedule_with_warmup,
 )
 
 from ghana_asr.config import AppConfig
 from ghana_asr.data.dataset import DataCollatorSpeechSeq2SeqWithPadding, GhanaSpeechASRDataset
-from ghana_asr.evaluation.metrics import MetricComputer
 from ghana_asr.utils.logging import get_logger
 from ghana_asr.utils.seeding import seed_everything
 
@@ -35,25 +37,29 @@ def run_training(cfg: AppConfig) -> Path:
     seed_everything(cfg.experiment.seed)
     out_dir = Path(cfg.experiment.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     with (out_dir / "run_config.yaml").open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg.raw, f, sort_keys=False)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
+        mixed_precision="bf16" if cfg.training.bf16 else ("fp16" if cfg.training.fp16 else "no"),
+        log_with=cfg.training.report_to,
+        project_dir=str(out_dir),
+    )
+    if accelerator.is_main_process:
+        accelerator.init_trackers(cfg.experiment.name)
 
     logger.info("Loading processor/model: %s", cfg.model.pretrained)
     processor = WhisperProcessor.from_pretrained(cfg.model.pretrained)
     model = WhisperForConditionalGeneration.from_pretrained(cfg.model.pretrained)
-
     model.generation_config.language = cfg.data.whisper_language
     model.generation_config.task = cfg.data.task
     model.generation_config.forced_decoder_ids = None
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
+    model.config.use_cache = False
     if cfg.training.gradient_checkpointing:
-        model.config.use_cache = False
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    else:
-        model.config.use_cache = False
-
     _maybe_freeze_encoder(model, cfg.model.freeze_encoder)
 
     manifest_dir = Path(cfg.data.manifest_dir)
@@ -71,87 +77,154 @@ def run_training(cfg: AppConfig) -> Path:
         whisper_language=cfg.data.whisper_language,
         task=cfg.data.task,
     )
-
     collator = DataCollatorSpeechSeq2SeqWithPadding(processor)
-    metrics = MetricComputer(processor)
 
-    tcfg = cfg.training
-    args_kwargs = dict(
-        output_dir=str(out_dir),
-        num_train_epochs=tcfg.num_train_epochs,
-        per_device_train_batch_size=tcfg.per_device_train_batch_size,
-        per_device_eval_batch_size=tcfg.per_device_eval_batch_size,
-        gradient_accumulation_steps=tcfg.gradient_accumulation_steps,
-        learning_rate=tcfg.learning_rate,
-        weight_decay=tcfg.weight_decay,
-        max_grad_norm=tcfg.max_grad_norm,
-        lr_scheduler_type=tcfg.lr_scheduler_type,
-        bf16=tcfg.bf16 and torch.cuda.is_available(),
-        fp16=tcfg.fp16 and torch.cuda.is_available() and not tcfg.bf16,
-        gradient_checkpointing=tcfg.gradient_checkpointing,
-        dataloader_num_workers=tcfg.dataloader_num_workers,
-        dataloader_pin_memory=tcfg.dataloader_pin_memory,
-        dataloader_persistent_workers=tcfg.dataloader_num_workers > 0,
-        eval_strategy=tcfg.evaluation_strategy,
-        eval_steps=tcfg.eval_steps,
-        save_steps=tcfg.save_steps,
-        save_total_limit=tcfg.save_total_limit,
-        logging_steps=tcfg.logging_steps,
-        predict_with_generate=tcfg.predict_with_generate,
-        generation_max_length=tcfg.generation_max_length,
-        load_best_model_at_end=tcfg.load_best_model_at_end,
-        metric_for_best_model=tcfg.metric_for_best_model,
-        greater_is_better=tcfg.greater_is_better,
-        report_to=tcfg.report_to,
-        remove_unused_columns=tcfg.remove_unused_columns,
-        run_name=cfg.experiment.name,
-        max_steps=tcfg.max_steps,
-        optim="adamw_torch",
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.training.per_device_train_batch_size,
+        shuffle=True,
+        num_workers=cfg.training.dataloader_num_workers,
+        pin_memory=cfg.training.dataloader_pin_memory,
+        persistent_workers=cfg.training.dataloader_num_workers > 0,
+        collate_fn=collator,
     )
-    if tcfg.warmup_ratio is not None:
-        args_kwargs["warmup_ratio"] = tcfg.warmup_ratio
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=cfg.training.per_device_eval_batch_size,
+        shuffle=False,
+        num_workers=min(2, cfg.training.dataloader_num_workers),
+        pin_memory=cfg.training.dataloader_pin_memory,
+        collate_fn=collator,
+    )
+
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.weight_decay,
+    )
+
+    steps_per_epoch = math.ceil(len(train_loader) / cfg.training.gradient_accumulation_steps)
+    if cfg.training.max_steps and cfg.training.max_steps > 0:
+        total_steps = cfg.training.max_steps
     else:
-        args_kwargs["warmup_steps"] = tcfg.warmup_steps
-
-    args = Seq2SeqTrainingArguments(**args_kwargs)
-    trainer = Seq2SeqTrainer(
-        args=args,
-        model=model,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        data_collator=collator,
-        processing_class=processor,
-        compute_metrics=metrics,
+        total_steps = steps_per_epoch * cfg.training.num_train_epochs
+    warmup = cfg.training.warmup_steps
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup, num_training_steps=total_steps
     )
 
-    logger.info(
-        "Starting training | train=%s eval=%s | device=%s",
-        len(train_ds),
-        len(eval_ds),
-        "cuda" if torch.cuda.is_available() else "cpu",
+    model, optimizer, train_loader, eval_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, eval_loader, scheduler
     )
-    train_result = trainer.train()
-    metrics_out = train_result.metrics
-    trainer.log_metrics("train", metrics_out)
-    trainer.save_metrics("train", metrics_out)
-    trainer.save_state()
 
+    # Sanity check one batch before the long run.
+    model.train()
+    first = next(iter(train_loader))
+    with torch.no_grad():
+        out = model(**first)
+        loss0 = out.loss.detach().float().item()
+    logger.info("Sanity batch loss=%.4f labels_shape=%s", loss0, tuple(first["labels"].shape))
+    if not math.isfinite(loss0) or loss0 <= 0:
+        raise RuntimeError(f"Sanity loss unhealthy: {loss0}")
+
+    global_step = 0
+    best_loss = float("inf")
     best_dir = out_dir / "best"
-    trainer.save_model(str(best_dir))
-    processor.save_pretrained(str(best_dir))
+    progress = tqdm(total=total_steps, disable=not accelerator.is_main_process, desc="train")
 
-    eval_metrics = trainer.evaluate()
-    trainer.log_metrics("eval", eval_metrics)
-    trainer.save_metrics("eval", eval_metrics)
+    for epoch in range(cfg.training.num_train_epochs):
+        model.train()
+        for batch in train_loader:
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                loss = outputs.loss
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"Non-finite loss at step {global_step}: {loss}")
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(
+                        model.parameters(), cfg.training.max_grad_norm
+                    )
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                    progress.update(1)
 
+                    if global_step % cfg.training.logging_steps == 0:
+                        lr = scheduler.get_last_lr()[0]
+                        logger.info(
+                            "step=%s epoch=%.3f loss=%.4f grad_norm=%s lr=%.3e",
+                            global_step,
+                            epoch + global_step / max(total_steps, 1),
+                            loss.detach().float().item(),
+                            float(grad_norm) if grad_norm is not None else None,
+                            lr,
+                        )
+                        accelerator.log(
+                            {
+                                "train/loss": loss.detach().float().item(),
+                                "train/lr": lr,
+                                "train/grad_norm": float(grad_norm)
+                                if grad_norm is not None
+                                else 0.0,
+                            },
+                            step=global_step,
+                        )
+
+                    if global_step % cfg.training.eval_steps == 0:
+                        val_loss = _evaluate(model, eval_loader, accelerator)
+                        logger.info("step=%s val_loss=%.4f", global_step, val_loss)
+                        accelerator.log({"eval/loss": val_loss}, step=global_step)
+                        if val_loss < best_loss:
+                            best_loss = val_loss
+                            _save_best(accelerator, model, processor, best_dir)
+                            logger.info("New best checkpoint -> %s", best_dir)
+                        model.train()
+
+                    if global_step % cfg.training.save_steps == 0:
+                        ckpt = out_dir / f"checkpoint-{global_step}"
+                        _save_best(accelerator, model, processor, ckpt)
+
+                    if global_step >= total_steps:
+                        break
+        if global_step >= total_steps:
+            break
+
+    progress.close()
+    # Final save
+    if not best_dir.exists():
+        _save_best(accelerator, model, processor, best_dir)
     summary = {
         "author": cfg.experiment.author,
         "experiment": cfg.experiment.name,
         "base_model": cfg.model.pretrained,
         "subsets": cfg.data.subsets,
-        "train_metrics": metrics_out,
-        "eval_metrics": eval_metrics,
+        "best_val_loss": best_loss,
+        "global_step": global_step,
     }
     (out_dir / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    accelerator.end_training()
     logger.info("Training complete. Best model -> %s", best_dir)
     return best_dir
+
+
+@torch.no_grad()
+def _evaluate(model, eval_loader, accelerator: Accelerator) -> float:
+    model.eval()
+    losses = []
+    for batch in eval_loader:
+        outputs = model(**batch)
+        loss = accelerator.gather(outputs.loss.detach()).mean()
+        losses.append(float(loss.float().cpu()))
+    return sum(losses) / max(len(losses), 1)
+
+
+def _save_best(accelerator: Accelerator, model, processor, path: Path) -> None:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    unwrapped = accelerator.unwrap_model(model)
+    if accelerator.is_main_process:
+        unwrapped.save_pretrained(path)
+        processor.save_pretrained(path)

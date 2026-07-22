@@ -17,12 +17,7 @@ logger = get_logger(__name__)
 
 
 class GhanaSpeechASRDataset(Dataset):
-    """Whisper fine-tuning dataset backed by a dense split cache parquet.
-
-    Tokenization is thread-safe: prefix token ids are captured once at init and
-    prepended to label sequences without mutating the shared tokenizer from
-    DataLoader workers.
-    """
+    """Whisper fine-tuning dataset backed by a dense split cache parquet."""
 
     def __init__(
         self,
@@ -46,12 +41,11 @@ class GhanaSpeechASRDataset(Dataset):
         self.whisper_language = whisper_language
         self.task = task
 
-        # Capture decoder prompt once (thread-safe for workers).
         tokenizer = processor.tokenizer
         tokenizer.set_prefix_tokens(language=whisper_language, task=task)
-        # prefix_ids typically: <|startoftranscript|> <|lang|> <|task|> <|notimestamps|>
         self._prefix_ids: list[int] = list(tokenizer.prefix_tokens)
         self._eos_id = tokenizer.eos_token_id
+        self._sot_id = tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
         logger.info(
             "Opened cache %s with %s examples | prefix_ids=%s",
             self.cache_path,
@@ -96,23 +90,17 @@ class GhanaSpeechASRDataset(Dataset):
         row = table.slice(offset, 1).to_pydict()
         return {k: v[0] for k, v in row.items()}
 
-    def _tokenize_labels(self, text: str) -> torch.Tensor:
-        # Tokenize transcript only (no specials), then prepend frozen prefix + EOS.
+    def _tokenize_labels(self, text: str) -> list[int]:
         tokenizer = self.processor.tokenizer
-        body = tokenizer(
-            text,
-            add_special_tokens=False,
-            return_attention_mask=False,
-        )["input_ids"]
+        body = tokenizer(text, add_special_tokens=False)["input_ids"]
         labels = self._prefix_ids + body
         if self._eos_id is not None:
             labels = labels + [self._eos_id]
-        return torch.tensor(labels, dtype=torch.long)
+        return labels
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self._get_row(idx)
         audio = decode_audio_bytes(row["audio"], target_sr=self.sampling_rate)
-
         features = self.processor.feature_extractor(
             audio,
             sampling_rate=self.sampling_rate,
@@ -124,34 +112,35 @@ class GhanaSpeechASRDataset(Dataset):
         return {
             "input_features": input_features,
             "labels": labels,
-            "id": row["id"],
-            "language": row["language"],
-            "subset": row["subset"],
             "text": row["text"],
-            "duration": float(row["duration"]),
         }
 
 
 class DataCollatorSpeechSeq2SeqWithPadding:
-    def __init__(self, processor: WhisperProcessor) -> None:
+    def __init__(self, processor: WhisperProcessor, sot_id: int | None = None) -> None:
         self.processor = processor
+        self.sot_id = (
+            sot_id
+            if sot_id is not None
+            else processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-        label_features = [{"input_ids": f["labels"]} for f in features]
+        # Always pass plain Python lists into tokenizer.pad for reliable masks.
+        label_features = [{"input_ids": list(f["labels"])} for f in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
-        # Whisper loss ignores the decoder start-of-transcript token.
-        sot = self.processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
-        if sot is not None and sot != self.processor.tokenizer.unk_token_id:
-            if (labels[:, 0] == sot).all().item():
-                labels = labels[:, 1:]
-        elif self.processor.tokenizer.bos_token_id is not None:
-            if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().item():
-                labels = labels[:, 1:]
+        if self.sot_id is not None and (labels[:, 0] == self.sot_id).all().item():
+            labels = labels[:, 1:]
+
+        # Guard: empty supervision would silently yield loss=0 / NaN grads.
+        valid = (labels != -100).any(dim=1)
+        if not bool(valid.all().item()):
+            raise RuntimeError("Batch contains examples with no supervised label tokens")
 
         batch["labels"] = labels
         return batch
