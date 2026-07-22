@@ -50,7 +50,9 @@ def run_training(cfg: AppConfig) -> Path:
     model.config.suppress_tokens = []
     if cfg.training.gradient_checkpointing:
         model.config.use_cache = False
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    else:
+        model.config.use_cache = False
 
     _maybe_freeze_encoder(model, cfg.model.freeze_encoder)
 
