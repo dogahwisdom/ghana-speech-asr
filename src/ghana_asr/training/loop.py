@@ -42,16 +42,18 @@ def run_training(cfg: AppConfig) -> Path:
 
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
-        mixed_precision="bf16" if cfg.training.bf16 else ("fp16" if cfg.training.fp16 else "no"),
-        log_with=cfg.training.report_to,
+        mixed_precision="no",
+        log_with=None,
         project_dir=str(out_dir),
     )
-    if accelerator.is_main_process:
-        accelerator.init_trackers(cfg.experiment.name)
 
     logger.info("Loading processor/model: %s", cfg.model.pretrained)
     processor = WhisperProcessor.from_pretrained(cfg.model.pretrained)
-    model = WhisperForConditionalGeneration.from_pretrained(cfg.model.pretrained)
+    model = WhisperForConditionalGeneration.from_pretrained(
+        cfg.model.pretrained,
+        torch_dtype=torch.float32,
+    )
+    model = model.float()
     model.generation_config.language = cfg.data.whisper_language
     model.generation_config.task = cfg.data.task
     model.generation_config.forced_decoder_ids = None
@@ -171,21 +173,10 @@ def run_training(cfg: AppConfig) -> Path:
                             float(grad_norm) if grad_norm is not None else None,
                             lr,
                         )
-                        accelerator.log(
-                            {
-                                "train/loss": loss.detach().float().item(),
-                                "train/lr": lr,
-                                "train/grad_norm": float(grad_norm)
-                                if grad_norm is not None
-                                else 0.0,
-                            },
-                            step=global_step,
-                        )
 
                     if global_step % cfg.training.eval_steps == 0:
                         val_loss = _evaluate(model, eval_loader, accelerator)
                         logger.info("step=%s val_loss=%.4f", global_step, val_loss)
-                        accelerator.log({"eval/loss": val_loss}, step=global_step)
                         if val_loss < best_loss:
                             best_loss = val_loss
                             _save_best(accelerator, model, processor, best_dir)
@@ -214,7 +205,6 @@ def run_training(cfg: AppConfig) -> Path:
         "global_step": global_step,
     }
     (out_dir / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    accelerator.end_training()
     logger.info("Training complete. Best model -> %s", best_dir)
     return best_dir
 
