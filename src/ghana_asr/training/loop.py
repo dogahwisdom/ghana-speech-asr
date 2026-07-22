@@ -136,18 +136,28 @@ def run_training(cfg: AppConfig) -> Path:
         model.train()
         for batch in train_loader:
             with accelerator.accumulate(model):
+                # Feature hygiene — rare corrupt clips can poison bf16/fp16 runs.
+                if not torch.isfinite(batch["input_features"]).all():
+                    logger.warning("Skipping batch with non-finite input features at step=%s", global_step)
+                    continue
                 outputs = model(**batch)
                 loss = outputs.loss
                 if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite loss at step {global_step}: {loss}")
+                    logger.warning("Skipping non-finite loss at step=%s", global_step)
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(
                         model.parameters(), cfg.training.max_grad_norm
                     )
+                    if grad_norm is not None and not torch.isfinite(grad_norm):
+                        logger.warning("Skipping non-finite grad_norm at step=%s", global_step)
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                     optimizer.step()
                     scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                     progress.update(1)
 
