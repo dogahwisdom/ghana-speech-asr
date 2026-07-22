@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.env.*
+
+# Training artifacts
+outputs/
+runs/
+checkpoints/
+manifests/
+*.pt
+*.bin
+*.safetensors
+wandb/
+lightning_logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+hf_token.txt
+*.pem
+credentials*

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghana-asr"
+version = "0.1.0"
+description = "Production ASR fine-tuning for Ghana Speech (Whisper) — Wisdom Dogah"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "CC-BY-NC-4.0" }
+authors = [
+  { name = "Wisdom Dogah", email = "158065419+dogahwisdom@users.noreply.github.com" },
+]
+keywords = ["asr", "whisper", "ghana-nlp", "speech", "ghanaian-languages"]
+dependencies = [
+  "torch>=2.2.0",
+  "torchaudio>=2.2.0",
+  "transformers>=4.44.0",
+  "datasets>=2.20.0",
+  "accelerate>=0.33.0",
+  "evaluate>=0.4.2",
+  "jiwer>=3.0.4",
+  "librosa>=0.10.2",
+  "soundfile>=0.12.1",
+  "polars>=1.0.0",
+  "pyyaml>=6.0.1",
+  "tqdm>=4.66.0",
+  "pyarrow>=15.0.0",
+  "tensorboard>=2.14.0",
+  "huggingface_hub>=0.24.0",
+  "sentencepiece>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.5.0"]
+
+[project.scripts]
+ghana-asr-prepare = "ghana_asr.cli.prepare:main"
+ghana-asr-train = "ghana_asr.cli.train:main"
+ghana-asr-eval = "ghana_asr.cli.evaluate:main"
+ghana-asr-push = "ghana_asr.cli.push:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,9 @@
+Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+
+This project produces model weights and documentation derived from the Ghana Speech
+dataset, which is licensed under CC BY-NC 4.0. Model checkpoints and training
+artifacts derived from that data must remain non-commercial.
+
+Author: Wisdom Dogah
+
+Full license text: https://creativecommons.org/licenses/by-nc/4.0/

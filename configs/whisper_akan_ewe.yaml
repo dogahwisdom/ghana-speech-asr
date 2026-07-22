@@ -1,0 +1,73 @@
+# Wisdom Dogah — Ghana Speech multilingual ASR (Whisper)
+# Target languages: Asante Twi, Akuapem Twi, Fante, Ewe
+
+experiment:
+  name: whisper_akan_ewe_v1
+  seed: 42
+  output_dir: outputs/whisper_akan_ewe_v1
+  author: Wisdom Dogah
+
+data:
+  root: /data/ghana-speech
+  subsets:
+    - Asante_Twi_twi
+    - Akuapem_Twi_twi
+    - Fante_fat
+    - Ewe_ewe
+  # Whisper language code used for prompting. Unsupported Ghanaian languages
+  # are trained with task=transcribe and a shared prompt language.
+  whisper_language: yo  # closest West-African proxy; model still learns target orthography
+  task: transcribe
+  sampling_rate: 16000
+  min_duration_s: 0.8
+  max_duration_s: 30.0
+  # Stratified by language + source_file to reduce speaker/chapter leakage
+  split_ratios:
+    train: 0.90
+    validation: 0.05
+    test: 0.05
+  # Cap per-language train hours for first competitive run (raise later)
+  max_train_hours_per_language: 40.0
+  max_eval_hours_per_language: 2.0
+  manifest_dir: manifests/whisper_akan_ewe_v1
+  num_proc: 8
+
+model:
+  # large-v3-turbo: strong quality with faster iteration on a 48h window
+  # Swap to openai/whisper-large-v3 for a longer full-quality run.
+  pretrained: openai/whisper-large-v3-turbo
+  freeze_encoder: false
+
+training:
+  num_train_epochs: 3
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler_type: cosine
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  evaluation_strategy: steps
+  eval_steps: 500
+  save_steps: 500
+  save_total_limit: 3
+  logging_steps: 25
+  predict_with_generate: true
+  generation_max_length: 225
+  load_best_model_at_end: true
+  metric_for_best_model: wer
+  greater_is_better: false
+  report_to: [tensorboard]
+  remove_unused_columns: false
+  group_by_length: false
+
+push:
+  # Fill after `huggingface-cli login`
+  repo_id: ghananlpcommunity/whisper-akan-ewe-wisdom-dogah
+  private: false
