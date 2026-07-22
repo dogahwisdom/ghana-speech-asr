@@ -91,6 +91,7 @@ def run_training(cfg: AppConfig) -> Path:
         gradient_checkpointing=tcfg.gradient_checkpointing,
         dataloader_num_workers=tcfg.dataloader_num_workers,
         dataloader_pin_memory=tcfg.dataloader_pin_memory,
+        dataloader_persistent_workers=tcfg.dataloader_num_workers > 0,
         eval_strategy=tcfg.evaluation_strategy,
         eval_steps=tcfg.eval_steps,
         save_steps=tcfg.save_steps,
