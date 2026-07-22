@@ -50,7 +50,6 @@ class TrainingConfig:
     per_device_eval_batch_size: int
     gradient_accumulation_steps: int
     learning_rate: float
-    warmup_ratio: float
     weight_decay: float
     max_grad_norm: float
     lr_scheduler_type: str
@@ -72,7 +71,9 @@ class TrainingConfig:
     report_to: list[str]
     remove_unused_columns: bool
     group_by_length: bool
-
+    warmup_steps: int = 400
+    warmup_ratio: float | None = None
+    max_steps: int = -1
 
 @dataclass
 class PushConfig:

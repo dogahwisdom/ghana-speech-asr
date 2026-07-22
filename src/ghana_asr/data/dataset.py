@@ -19,8 +19,9 @@ logger = get_logger(__name__)
 class GhanaSpeechASRDataset(Dataset):
     """Whisper fine-tuning dataset backed by a dense split cache parquet.
 
-    Builds a row-group index once, then reads only the needed row group per
-    sample (standard pattern for large Parquet corpora).
+    Tokenization is thread-safe: prefix token ids are captured once at init and
+    prepended to label sequences without mutating the shared tokenizer from
+    DataLoader workers.
     """
 
     def __init__(
@@ -44,7 +45,19 @@ class GhanaSpeechASRDataset(Dataset):
         self.sampling_rate = sampling_rate
         self.whisper_language = whisper_language
         self.task = task
-        logger.info("Opened cache %s with %s examples", self.cache_path, self._num_rows)
+
+        # Capture decoder prompt once (thread-safe for workers).
+        tokenizer = processor.tokenizer
+        tokenizer.set_prefix_tokens(language=whisper_language, task=task)
+        # prefix_ids typically: <|startoftranscript|> <|lang|> <|task|> <|notimestamps|>
+        self._prefix_ids: list[int] = list(tokenizer.prefix_tokens)
+        self._eos_id = tokenizer.eos_token_id
+        logger.info(
+            "Opened cache %s with %s examples | prefix_ids=%s",
+            self.cache_path,
+            self._num_rows,
+            self._prefix_ids,
+        )
 
     def _build_row_group_starts(self) -> list[int]:
         starts = [0]
@@ -58,7 +71,6 @@ class GhanaSpeechASRDataset(Dataset):
     def _locate(self, idx: int) -> tuple[int, int]:
         if idx < 0 or idx >= self._num_rows:
             raise IndexError(idx)
-        # Binary search over cumulative starts.
         lo, hi = 0, len(self._rg_starts) - 2
         while lo <= hi:
             mid = (lo + hi) // 2
@@ -78,12 +90,24 @@ class GhanaSpeechASRDataset(Dataset):
                 rg_id,
                 columns=["id", "language", "text", "duration", "subset", "audio"],
             )
-            # Keep a small LRU-ish cache of row groups.
             if len(self._rg_cache) >= 4:
                 self._rg_cache.clear()
             self._rg_cache[rg_id] = table
         row = table.slice(offset, 1).to_pydict()
         return {k: v[0] for k, v in row.items()}
+
+    def _tokenize_labels(self, text: str) -> torch.Tensor:
+        # Tokenize transcript only (no specials), then prepend frozen prefix + EOS.
+        tokenizer = self.processor.tokenizer
+        body = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        labels = self._prefix_ids + body
+        if self._eos_id is not None:
+            labels = labels + [self._eos_id]
+        return torch.tensor(labels, dtype=torch.long)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self._get_row(idx)
@@ -95,12 +119,7 @@ class GhanaSpeechASRDataset(Dataset):
             return_tensors="pt",
         )
         input_features = features.input_features.squeeze(0)
-
-        self.processor.tokenizer.set_prefix_tokens(
-            language=self.whisper_language,
-            task=self.task,
-        )
-        labels = self.processor.tokenizer(row["text"], return_tensors="pt").input_ids.squeeze(0)
+        labels = self._tokenize_labels(row["text"])
 
         return {
             "input_features": input_features,
@@ -125,9 +144,14 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
-        bos = self.processor.tokenizer.bos_token_id
-        if bos is not None and (labels[:, 0] == bos).all().item():
-            labels = labels[:, 1:]
+        # Whisper loss ignores the decoder start-of-transcript token.
+        sot = self.processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        if sot is not None and sot != self.processor.tokenizer.unk_token_id:
+            if (labels[:, 0] == sot).all().item():
+                labels = labels[:, 1:]
+        elif self.processor.tokenizer.bos_token_id is not None:
+            if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().item():
+                labels = labels[:, 1:]
 
         batch["labels"] = labels
         return batch

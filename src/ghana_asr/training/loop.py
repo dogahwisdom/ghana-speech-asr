@@ -74,14 +74,13 @@ def run_training(cfg: AppConfig) -> Path:
     metrics = MetricComputer(processor)
 
     tcfg = cfg.training
-    args = Seq2SeqTrainingArguments(
+    args_kwargs = dict(
         output_dir=str(out_dir),
         num_train_epochs=tcfg.num_train_epochs,
         per_device_train_batch_size=tcfg.per_device_train_batch_size,
         per_device_eval_batch_size=tcfg.per_device_eval_batch_size,
         gradient_accumulation_steps=tcfg.gradient_accumulation_steps,
         learning_rate=tcfg.learning_rate,
-        warmup_ratio=tcfg.warmup_ratio,
         weight_decay=tcfg.weight_decay,
         max_grad_norm=tcfg.max_grad_norm,
         lr_scheduler_type=tcfg.lr_scheduler_type,
@@ -102,10 +101,16 @@ def run_training(cfg: AppConfig) -> Path:
         greater_is_better=tcfg.greater_is_better,
         report_to=tcfg.report_to,
         remove_unused_columns=tcfg.remove_unused_columns,
-        logging_dir=str(out_dir / "tb"),
         run_name=cfg.experiment.name,
+        max_steps=tcfg.max_steps,
+        optim="adamw_torch",
     )
+    if tcfg.warmup_ratio is not None:
+        args_kwargs["warmup_ratio"] = tcfg.warmup_ratio
+    else:
+        args_kwargs["warmup_steps"] = tcfg.warmup_steps
 
+    args = Seq2SeqTrainingArguments(**args_kwargs)
     trainer = Seq2SeqTrainer(
         args=args,
         model=model,
